@@ -7,10 +7,62 @@ import joblib
 import os
 
 # Configuration
-# Use absolute paths relative to this file to ensure it works from any CWD
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(BASE_DIR, "data", "clients.db")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "entity_resolution_model.pkl")
+DB_PATH = "data/clients.db"
+MODEL_PATH = "models/entity_resolution_model.pkl"
+
+def analyze_blocking_stats(conn, pairs_count):
+    """
+    Calculates and prints health metrics for the blocking strategy.
+    Critical for ensuring the system scales to millions of records.
+    """
+    print("\n--- Blocking Performance Report ---")
+    
+    # 1. Total Records
+    try:
+        total_records = pd.read_sql("SELECT COUNT(*) FROM clients_processed", conn).iloc[0, 0]
+    except:
+        total_records = 0
+        
+    print(f"Total Records: {total_records:,}")
+    
+    # 2. Reduction Ratio
+    # Total possible pairs = N * (N-1) / 2
+    # This metric tells us how much work we avoided compared to a full comparison.
+    # Target: > 99.9% for large datasets.
+    total_possible = (total_records * (total_records - 1)) / 2
+    reduction_ratio = 1 - (pairs_count / total_possible) if total_possible > 0 else 0
+    
+    print(f"Candidate Pairs: {pairs_count:,}")
+    print(f"Reduction Ratio: {reduction_ratio:.8%}")
+    print(f"Pairs per Record: {pairs_count / total_records:.2f}" if total_records > 0 else "Pairs per Record: N/A")
+    
+    # 3. Block Size Analysis (The "Heavy Hitters")
+    # Large blocks (e.g., "Smith") cause quadratic explosions (O(N^2)).
+    # We monitor the Top 3 largest blocks to identify "Stop Words" or generic values.
+    keys = ['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_phone', 'bk_email']
+    
+    print("\n[Block Size Analysis - Top 3 Largest Blocks per Key]")
+    for key in keys:
+        query = f"""
+        SELECT {key}, COUNT(*) as cnt 
+        FROM clients_processed 
+        WHERE {key} IS NOT NULL 
+        GROUP BY {key} 
+        ORDER BY cnt DESC 
+        LIMIT 3
+        """
+        top_blocks = pd.read_sql(query, conn)
+        print(f"Key: {key}")
+        if top_blocks.empty:
+            print("  (No keys found)")
+        else:
+            for _, row in top_blocks.iterrows():
+                # Alert if block size is dangerous (> 50 is arbitrary for this small dataset, 
+                # but for 50M records, > 1000 is usually the danger zone)
+                alert = " [WARNING: Large Block]" if row['cnt'] > 50 else ""
+                print(f"  '{row[key]}': {row['cnt']} records{alert}")
+                
+    print("-" * 30 + "\n")
 
 def get_candidates(conn):
     """
@@ -30,12 +82,17 @@ def get_candidates(conn):
         (t1.bk_nid = t2.bk_nid AND t1.bk_nid IS NOT NULL) OR
         (t1.bk_phonetic_year = t2.bk_phonetic_year AND t1.bk_phonetic_year IS NOT NULL) OR
         (t1.bk_initials = t2.bk_initials AND t1.bk_initials IS NOT NULL) OR
-        (t1.bk_contact = t2.bk_contact AND t1.bk_contact IS NOT NULL)
+        (t1.bk_phone = t2.bk_phone AND t1.bk_phone IS NOT NULL) OR
+        (t1.bk_email = t2.bk_email AND t1.bk_email IS NOT NULL)
     WHERE t1.record_id < t2.record_id
     """
     
     pairs = pd.read_sql(query, conn)
     print(f"Found {len(pairs)} candidate pairs.")
+    
+    # Run Health Check
+    analyze_blocking_stats(conn, len(pairs))
+    
     return pairs
 
 def calculate_features(pairs, df_dict):
@@ -136,6 +193,60 @@ def calculate_features(pairs, df_dict):
         
     return pd.DataFrame(features)
 
+def decide_match_status(row):
+    """
+    Determines the match status (match, review, no_match) for a single pair row.
+    Expects row to have feature columns and 'ml_prob'.
+    """
+    # Calculate Name Similarity Average
+    name_avg = (row['first_name_score'] + row['last_name_score']) / 2
+    
+    # --- RULE BASED LOGIC (High Precision) ---
+    
+    # RULE 1: Strong National ID Match
+    if row['nid_score'] >= 0.85 and name_avg > 0.5:
+        return 'match'
+        
+    # RULE 2: Email/Phone Match (Corroborated)
+    if (row['email_score'] > 0.95 or row['phone_match'] == 1) and name_avg > 0.8:
+        return 'match'
+        
+    # RULE 3: Strong Name + Date Match
+    if name_avg > 0.85 and row['dob_match'] == 1:
+        return 'match'
+        
+    # RULE 4: Strong Name + Address Match
+    if name_avg > 0.85 and row['addr_score'] > 0.7:
+        return 'match'
+        
+    # RULE 5: Very Strong Name Match (Rare Name assumption)
+    if name_avg > 0.93 and row['year_match'] == 1:
+        return 'match'
+        
+    # --- ML MODEL RESCUE (High Recall) ---
+    if row['ml_prob'] > 0.5:
+            return 'match'
+            
+    # --- MANUAL REVIEW (Gray Area) ---
+    # 1. ML Uncertainty: Model thinks there's a chance (20-50%)
+    if row['ml_prob'] > 0.2:
+        return 'review'
+        
+    # 2. Strong ID but weak name (Possible data entry error or fraud)
+    if row['nid_score'] >= 0.85:
+        return 'review'
+        
+    # 3. Very Strong Name but no other corroboration (Possible missing data)
+    if name_avg > 0.9:
+        return 'review'
+        
+    # 4. Exact Email Match (New Rule)
+    # Emails are unique. If they match, it's highly suspicious even if names differ.
+    if row['email_score'] == 1.0:
+        return 'review'
+
+    return 'no_match'
+
 def classify_pairs(features_df):
     """
     Decides if a pair is a match based on feature scores.
@@ -157,7 +268,6 @@ def classify_pairs(features_df):
         feature_cols = [
             'nid_score', 'email_score', 'phone_match', 
             'first_name_score', 'last_name_score', 
-            'addr_score', 'city_score', 
             'dob_match', 'year_match'
         ]
         # Ensure columns exist and are in correct order
@@ -168,52 +278,12 @@ def classify_pairs(features_df):
     else:
         features_df['ml_prob'] = 0.0
     
-    def is_match(row):
-        # Calculate Name Similarity Average
-        name_avg = (row['first_name_score'] + row['last_name_score']) / 2
-        
-        # --- RULE BASED LOGIC (High Precision) ---
-        
-        # RULE 1: Strong National ID Match
-        # National IDs are generally unique to an individual.
-        # We trust this highly, but still require minimal name plausibility to catch data entry errors.
-        # Score > 0.85 allows for 1 transposition in a 9-digit ID (0.88) or 1 substitution (0.88)
-        if row['nid_score'] >= 0.85 and name_avg > 0.5:
-            return 1
-            
-        # RULE 2: Email/Phone Match (Corroborated)
-        # Shared email/phone is common (families, fraud). 
-        # We require a decent name match to confirm it's the same person, not just a relative.
-        # If name is VERY different, it might be a family member -> Manual Review (Not implemented here, so we treat as 0)
-        if (row['email_score'] > 0.95 or row['phone_match'] == 1) and name_avg > 0.8:
-            return 1
-            
-        # RULE 3: Strong Name + Date Match
-        # If names are very similar AND DOB is exact
-        if name_avg > 0.85 and row['dob_match'] == 1:
-            return 1
-            
-        # RULE 4: Strong Name + Address Match
-        # If names are similar AND Address is similar (catches cases with wrong DOB)
-        if name_avg > 0.85 and row['addr_score'] > 0.7:
-            return 1
-            
-        # RULE 5: Very Strong Name Match (Rare Name assumption)
-        # If names are almost identical (typo) and Year matches
-        if name_avg > 0.93 and row['year_match'] == 1:
-            return 1
-            
-        # --- ML MODEL RESCUE (High Recall) ---
-        # If rules didn't catch it, but model is confident
-        # We use a threshold of 0.5 (standard) or higher if we want to be conservative.
-        # Since we want to improve recall for edge cases, 0.5 is a good start.
-        if row['ml_prob'] > 0.5:
-             return 1
-            
-        return 0
-
-    features_df['is_match'] = features_df.apply(is_match, axis=1)
-    print(f"Classified {features_df['is_match'].sum()} matches out of {len(features_df)} pairs.")
+    features_df['match_type'] = features_df.apply(decide_match_status, axis=1)
+    features_df['is_match'] = (features_df['match_type'] == 'match').astype(int)
+    
+    counts = features_df['match_type'].value_counts()
+    print(f"Classification Results:\n{counts}")
+    
     return features_df
 
 def resolve_entities(features_df, all_record_ids):
@@ -242,7 +312,7 @@ def resolve_entities(features_df, all_record_ids):
     print(f"Resolved {len(all_record_ids)} records into {len(set(entity_map.values()))} unique entities.")
     return pd.DataFrame(list(entity_map.items()), columns=['record_id', 'predicted_entity_id'])
 
-def evaluate_results(predictions_df, conn):
+def evaluate_results(predictions_df, classified_df, conn):
     """
     Compares predictions against Ground Truth.
     """
@@ -270,9 +340,42 @@ def evaluate_results(predictions_df, conn):
     true_pairs = get_pairs(merged, 'true_entity_id')
     pred_pairs = get_pairs(merged, 'predicted_entity_id')
     
+    # Identify Review Pairs
+    # We need to ensure order doesn't matter for set intersection
+    review_mask = classified_df['match_type'] == 'review'
+    review_pairs = set()
+    for _, row in classified_df[review_mask].iterrows():
+        # Store both directions to be safe, or sort them
+        p1 = (row['id_a'], row['id_b'])
+        p2 = (row['id_b'], row['id_a'])
+        review_pairs.add(p1)
+        review_pairs.add(p2)
+    
     tp = len(true_pairs.intersection(pred_pairs))
-    fp = len(pred_pairs - true_pairs)
-    fn = len(true_pairs - pred_pairs)
+    fp_pairs = pred_pairs - true_pairs
+    fn_pairs = true_pairs - pred_pairs
+    
+    # Filter FN: Remove pairs that are in the Review bucket
+    # fn_pairs are (id_a, id_b) tuples. We check if they exist in review_pairs
+    caught_in_review = len(fn_pairs.intersection(review_pairs))
+    truly_missed_pairs = fn_pairs - review_pairs
+    
+    fp = len(fp_pairs)
+    fn = len(fn_pairs)
+    
+    # Export Truly Missed Matches (FN - Review)
+    if len(truly_missed_pairs) > 0:
+        missed_df = pd.DataFrame(list(truly_missed_pairs), columns=['id_a', 'id_b'])
+        missed_path = "data/missed_matches.csv"
+        missed_df.to_csv(missed_path, index=False)
+        print(f"Exported {len(missed_df)} truly missed matches to {missed_path}")
+
+    # Export False Matches (FP)
+    if fp > 0:
+        fp_df = pd.DataFrame(list(fp_pairs), columns=['id_a', 'id_b'])
+        fp_path = "data/false_matches.csv"
+        fp_df.to_csv(fp_path, index=False)
+        print(f"Exported {len(fp_df)} false matches to {fp_path}")
     
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
@@ -284,6 +387,8 @@ def evaluate_results(predictions_df, conn):
     print(f"Correct Matches (TP): {tp}")
     print(f"False Matches (FP): {fp}")
     print(f"Missed Matches (FN): {fn}")
+    print(f"  - Caught in Review: {caught_in_review} (These are NOT auto-linked, but flagged for human)")
+    print(f"  - Truly Missed:     {len(truly_missed_pairs)} (Neither auto-linked nor flagged)")
     print("-" * 30)
     print(f"Precision: {precision:.4f}")
     print(f"Recall:    {recall:.4f}")
@@ -313,11 +418,19 @@ def run_matching():
     predictions_df = resolve_entities(classified_df, all_record_ids)
     
     # 6. Evaluation
-    evaluate_results(predictions_df, conn)
+    evaluate_results(predictions_df, classified_df, conn)
+    
+    # 7. Export Manual Review Cases
+    review_cases = classified_df[classified_df['match_type'] == 'review']
+    if not review_cases.empty:
+        review_path = "data/manual_review_cases.csv"
+        review_cases.to_csv(review_path, index=False)
+        print(f"Exported {len(review_cases)} cases for manual review to {review_path}")
     
     conn.close()
     return predictions_df
 
 if __name__ == "__main__":
     run_matching()
+    
 

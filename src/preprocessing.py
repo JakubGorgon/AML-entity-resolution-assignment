@@ -3,9 +3,11 @@ import pandas as pd
 from unidecode import unidecode
 import jellyfish
 import re
+import os
 
 # Configuration
-DB_PATH = "../data/clients.db"
+# Assuming script is run from project root
+DB_PATH = "data/clients.db"
 
 def normalize_text(text):
     """Standardizes text: lowercase, ascii only, stripped."""
@@ -177,19 +179,18 @@ def create_blocking_keys(df):
 
     df['bk_initials'] = df.apply(make_bk_initials, axis=1)
 
-    # KEY 4: Contact Info (Phone/Email)
-    # Catches cases where Name AND Date are both wrong/typo'd.
-    # We use the last 6 digits of phone (very specific) or the normalized email.
-    def make_bk_contact(row):
-        # Try Phone first (Last 6 digits)
+    # KEY 4: Phone (Last 6 digits)
+    # Good for catching typos in names/DOBs
+    def make_bk_phone(row):
         if row['norm_phone'] and len(row['norm_phone']) >= 6:
-            return "ph_" + row['norm_phone'][-6:]
-        # Fallback to Email if Phone not available
-        if row['norm_email']:
-            return "em_" + row['norm_email']
+            return row['norm_phone'][-6:]
         return None
+    df['bk_phone'] = df.apply(make_bk_phone, axis=1)
 
-    df['bk_contact'] = df.apply(make_bk_contact, axis=1)
+    # KEY 5: Email (Exact)
+    # Very strong key, catches almost all digital interactions
+    # Ensure we don't block on empty strings or None
+    df['bk_email'] = df['norm_email'].apply(lambda x: x if x else None)
 
     return df
 
@@ -207,11 +208,11 @@ def run_preprocessing():
     print(df[['dob', 'norm_dob_year']].head(10))
     
     print("\n--- Blocking Keys Check ---")
-    print(df[['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_contact']].head(5))
+    print(df[['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_phone', 'bk_email']].head(5))
     
     # Coverage Report
     # NOTE: Count how many keys are present per record. Useful for monitoring to see if data quality degrades -> more blocking keys may be needed.  
-    df['key_count'] = df[['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_contact']].notna().sum(axis=1)
+    df['key_count'] = df[['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_phone', 'bk_email']].notna().sum(axis=1)
     print("\n--- Blocking Key Coverage ---")
     print(df['key_count'].value_counts().sort_index())
     print(f"Orphans (0 keys): {len(df[df['key_count'] == 0])}")

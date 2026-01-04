@@ -10,7 +10,8 @@ from unidecode import unidecode  # Make sure to pip install unidecode
 
 # Config
 RANDOM_SEED = 42
-OUTPUT_DIR = "../data"
+# Assuming script is run from project root
+OUTPUT_DIR = "data"
 DB_NAME = "clients.db"
 CSV_NAME = "messy_data.csv"
 
