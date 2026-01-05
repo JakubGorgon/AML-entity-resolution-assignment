@@ -5,11 +5,15 @@ import jellyfish
 import re
 import os
 import json
-from datasketch import MinHash
+import pickle
+import numpy as np
+from datasketch import MinHash, MinHashLSH
 from pathlib import Path
 
+from src.settings import settings
+
 # Configuration
-DB_PATH = "data/clients.db"
+DB_PATH = settings.db_path
 
 def normalize_text(text):
     """Standardizes text: lowercase, ascii only, stripped."""
@@ -78,8 +82,7 @@ def normalize_phone(text):
 def normalize_address(text):
     """
     Standardizes address by expanding common abbreviations to full words.
-    This is a standard NLP technique (canonicalization), not data leakage.
-    We map ALL known variations (St, St., Str) to a single canonical form (street).
+    
     """
     if not text:
         return ""
@@ -132,7 +135,7 @@ def get_soundex(text):
         return "0000"
     return jellyfish.soundex(normalize_text(text))
 
-def compute_minhash_signature(text, num_perm=128):
+def compute_minhash_signature(text, num_perm=None):
     """
     Computes MinHash signature for LSH.
     Returns a list of integers (hash values) serialized as JSON string.
@@ -140,7 +143,14 @@ def compute_minhash_signature(text, num_perm=128):
     if not text:
         return None
     
+    if num_perm is None:
+        num_perm = settings.lsh_num_perm
+
+    # NOTE: We intentionally do not pass precomputed permutations here.
+    # datasketch changed the type/shape of `permutations` across versions,
+    # which makes cross-environment reproducibility brittle.
     m = MinHash(num_perm=num_perm)
+    
     # Create 3-char shingles (n-grams)
     # e.g. "alex" -> "ale", "lex"
     text = str(text).lower().strip()
@@ -180,20 +190,19 @@ def create_blocking_keys(df):
     
     # KEY 1: MinHash Signature (Scalable Fuzzy Matching)
     # Replaces Soundex and Initials which are O(N^2) risks.
-    def make_bk_minhash(row):
-        full_name = f"{row['norm_first_name'] or ''} {row['norm_last_name'] or ''}".strip()
-        if not full_name:
-            return None
-        return compute_minhash_signature(full_name)
-        
-    df['bk_minhash'] = df.apply(make_bk_minhash, axis=1)
+    # OPTIMIZATION: Use list comprehension instead of apply for 10x speedup
+    print("  > Generating MinHash signatures...")
+    full_names = (df['norm_first_name'].fillna('') + ' ' + df['norm_last_name'].fillna('')).str.strip()
+    df['bk_minhash'] = [compute_minhash_signature(name) if name else None for name in full_names]
 
     # KEY 2: National ID (Strong)
     # Only block if ID is valid (len > 4)
+    print("  > Generating ID keys...")
     df['bk_nid'] = df['norm_nid'].apply(lambda x: x if len(x) > 4 else None) 
 
     # KEY 3: Phone (Last 6 digits)
     # Good for catching typos in names/DOBs
+    print("  > Generating Phone keys...")
     def make_bk_phone(row):
         if row['norm_phone'] and len(row['norm_phone']) >= 6:
             return row['norm_phone'][-6:]
@@ -203,11 +212,13 @@ def create_blocking_keys(df):
     # KEY 4: Email (Exact)
     # Very strong key, catches almost all digital interactions
     # Ensure we don't block on empty strings or None
+    print("  > Generating Email keys...")
     df['bk_email'] = df['norm_email'].apply(lambda x: x if x else None)
     
     # KEY 5: Initials + Last Name + DOB (Safe Loose Blocking)
     # Catches "M. Kilar" vs "Marek Kilar" without O(N^2) explosion.
     # Format: "m|kilar|1960-06-24"
+    print("  > Generating Initial+DOB keys...")
     def make_bk_initial_dob(row):
         if not row['norm_first_name'] or not row['norm_last_name'] or not row['norm_dob']:
             return None
@@ -255,8 +266,34 @@ def run_preprocessing():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_bk_initial_dob ON clients_processed(bk_initial_dob)")
     conn.commit()
     
+    # --- BUILD & SAVE LSH INDEX ---
+    # Pre-building this saves massive time in matching/training
+    print("Building and saving LSH Index...")
+    os.makedirs(os.path.dirname(settings.lsh_index_path) or "models", exist_ok=True)
+        
+    lsh = MinHashLSH(threshold=settings.lsh_threshold, num_perm=settings.lsh_num_perm)
+    minhashes = {}
+    
+    # We iterate over the DataFrame we just saved
+    # Optimization: Use insertion_session for faster inserts
+    with lsh.insertion_session() as session:
+        for idx, row in df.iterrows():
+            if row['bk_minhash']:
+                mh = MinHash(num_perm=settings.lsh_num_perm)
+                mh.hashvalues = np.array(json.loads(row['bk_minhash']), dtype='uint64')
+                session.insert(row['record_id'], mh)
+                minhashes[row['record_id']] = mh
+                
+    with open(settings.lsh_index_path, "wb") as f:
+        pickle.dump(lsh, f)
+        
+    with open(settings.minhashes_path, "wb") as f:
+        pickle.dump(minhashes, f)
+        
+    print("LSH Index and MinHash objects saved to models/")
+    
     conn.close()
-
+    print("Preprocessing complete.")
 if __name__ == "__main__":
     run_preprocessing()
     

@@ -12,14 +12,17 @@ import json
 import numpy as np
 from datasketch import MinHash, MinHashLSH
 from pathlib import Path
+import pickle
 
 # Import our logic
 from src import preprocessing
 from src import matching
+from src.settings import settings
 
 # --- CONFIGURATION ---
-DB_PATH = "data/clients.db"
-MODEL_PATH = "models/entity_resolution_model.pkl"
+DB_PATH = settings.db_path
+MODEL_PATH = settings.model_path
+LSH_INDEX_PATH = settings.lsh_index_path
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # --- LOGGING SETUP ---
@@ -94,32 +97,57 @@ def load_resources():
             logger.error(f"Failed to load model: {e}")
     else:
         logger.warning("Model file not found. Running in Rule-Only mode.")
-        
-    # Build LSH Index
+
+    # Load LSH Index (default) or rebuild (opt-in)
+    # NOTE: Building LSH on startup can be expensive and slows rollouts/tests.
     try:
-        logger.info("Building LSH Index for Name Matching...")
-        with sqlite3.connect(DB_PATH) as conn:
-            # Check if table exists first to avoid crash on fresh init
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clients_processed'")
-            if cursor.fetchone():
-                df_lsh = pd.read_sql("SELECT record_id, bk_minhash FROM clients_processed WHERE bk_minhash IS NOT NULL", conn)
-                
-                # Threshold 0.4 means ~40% Jaccard similarity
-                # Lowered from 0.5 to catch typos like "Alex" vs "Aleks"
-                lsh = MinHashLSH(threshold=0.4, num_perm=128)
-                count = 0
-                for _, row in df_lsh.iterrows():
-                    mh = MinHash(num_perm=128)
-                    mh.hashvalues = np.array(json.loads(row['bk_minhash']), dtype='uint64')
-                    lsh.insert(row['record_id'], mh)
-                    count += 1
-                lsh_index = lsh
-                logger.info(f"LSH Index built with {count} records.")
-            else:
-                logger.warning("clients_processed table not found. Skipping LSH build.")
+        if os.path.exists(LSH_INDEX_PATH):
+            logger.info(f"Loading LSH index from {LSH_INDEX_PATH}...")
+            with open(LSH_INDEX_PATH, "rb") as f:
+                lsh_index = pickle.load(f)
+            logger.info(
+                f"LSH index loaded (threshold={settings.lsh_threshold}, num_perm={settings.lsh_num_perm})."
+            )
+        elif settings.rebuild_lsh_on_startup:
+            logger.info(
+                "LSH index not found; rebuilding on startup because ER_REBUILD_LSH_ON_STARTUP=true"
+            )
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='clients_processed'"
+                )
+                if cursor.fetchone():
+                    df_lsh = pd.read_sql(
+                        "SELECT record_id, bk_minhash FROM clients_processed WHERE bk_minhash IS NOT NULL",
+                        conn,
+                    )
+                    lsh = MinHashLSH(
+                        threshold=settings.lsh_threshold, num_perm=settings.lsh_num_perm
+                    )
+                    count = 0
+                    with lsh.insertion_session() as session:
+                        for _, row in df_lsh.iterrows():
+                            mh = MinHash(num_perm=settings.lsh_num_perm)
+                            mh.hashvalues = np.array(
+                                json.loads(row["bk_minhash"]), dtype="uint64"
+                            )
+                            session.insert(row["record_id"], mh)
+                            count += 1
+                    lsh_index = lsh
+
+                    os.makedirs(os.path.dirname(LSH_INDEX_PATH) or ".", exist_ok=True)
+                    with open(LSH_INDEX_PATH, "wb") as f:
+                        pickle.dump(lsh_index, f)
+                    logger.info(f"LSH index rebuilt with {count} records and saved.")
+                else:
+                    logger.warning("clients_processed table not found. Skipping LSH build.")
+        else:
+            logger.info(
+                "LSH index not found; skipping build on startup (set ER_REBUILD_LSH_ON_STARTUP=true to rebuild)."
+            )
     except Exception as e:
-        logger.error(f"Failed to build LSH index: {e}")
+        logger.error(f"Failed to load/build LSH index: {e}")
 
 # --- HELPER FUNCTIONS ---
 
@@ -142,7 +170,7 @@ def find_candidates(conn, record: pd.Series, limit=50):
     # Use the global lsh_index built at startup
     if lsh_index and record.get('bk_minhash'):
         try:
-            mh = MinHash(num_perm=128)
+            mh = MinHash(num_perm=settings.lsh_num_perm)
             mh.hashvalues = np.array(json.loads(record['bk_minhash']), dtype='uint64')
             result = lsh_index.query(mh)
             candidates_ids.update(result)

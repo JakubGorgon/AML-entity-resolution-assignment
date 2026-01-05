@@ -5,14 +5,18 @@ import jellyfish
 import networkx as nx
 from datetime import datetime
 import joblib
+import pickle
 import os
 import json
 from datasketch import MinHash, MinHashLSH
 from pathlib import Path
+from typing import Any
+
+from src.settings import settings
 
 # Configuration
-DB_PATH = "data/clients.db"
-MODEL_PATH = "models/entity_resolution_model.pkl"
+DB_PATH = settings.db_path
+MODEL_PATH = settings.model_path
 
 def analyze_blocking_stats(conn, pairs_count):
     """
@@ -23,8 +27,11 @@ def analyze_blocking_stats(conn, pairs_count):
     
     # 1. Total Records
     try:
-        total_records = pd.read_sql("SELECT COUNT(*) FROM clients_processed", conn).iloc[0, 0]
-    except:
+        total_records_raw: Any = pd.read_sql(
+            "SELECT COUNT(*) FROM clients_processed", conn
+        ).iloc[0, 0]
+        total_records = int(pd.to_numeric(total_records_raw, errors="coerce") or 0)
+    except Exception:
         total_records = 0
         
     print(f"Total Records: {total_records:,}")
@@ -76,25 +83,47 @@ def get_candidates(conn):
     print("Generating candidates via LSH & Blocking Keys...")
     
     # 1. LSH for Fuzzy Name Matching
-    print("  > Building LSH Index for Names...")
-    # Only fetch records that have a minhash signature
-    df_lsh = pd.read_sql("SELECT record_id, bk_minhash FROM clients_processed WHERE bk_minhash IS NOT NULL", conn)
+    lsh_path = settings.lsh_index_path
+    minhashes_path = settings.minhashes_path
+    lsh_pairs = set()
     
-    # Threshold 0.4 means ~40% Jaccard similarity
-    # Lowered from 0.5 to catch more typos and initial variations
-    lsh = MinHashLSH(threshold=0.4, num_perm=128)
-    minhashes = {}
-    
-    for _, row in df_lsh.iterrows():
-        mh = MinHash(num_perm=128)
-        # Load hashvalues from JSON and convert to numpy array of uint64
-        mh.hashvalues = np.array(json.loads(row['bk_minhash']), dtype='uint64')
-        lsh.insert(row['record_id'], mh)
-        minhashes[row['record_id']] = mh
+    if os.path.exists(lsh_path) and os.path.exists(minhashes_path):
+        print("  > Loading LSH Index from disk (Fast)...")
+        try:
+            with open(lsh_path, "rb") as f:
+                lsh = pickle.load(f)
+            with open(minhashes_path, "rb") as f:
+                minhashes = pickle.load(f)
+            print(f"  > Loaded LSH Index with {len(minhashes)} records.")
+        except Exception as e:
+            print(f"  > Failed to load LSH index: {e}. Rebuilding...")
+            lsh = None
+            minhashes = None
+    else:
+        print("  > LSH Index not found on disk. Rebuilding...")
+        lsh = None
+
+    if lsh is None:
+        print("  > Building LSH Index for Names...")
+        # Only fetch records that have a minhash signature
+        df_lsh = pd.read_sql("SELECT record_id, bk_minhash FROM clients_processed WHERE bk_minhash IS NOT NULL", conn)
+        
+        lsh = MinHashLSH(threshold=settings.lsh_threshold, num_perm=settings.lsh_num_perm)
+        minhashes = {}
+        
+        for _, row in df_lsh.iterrows():
+            mh = MinHash(num_perm=settings.lsh_num_perm)
+            # Load hashvalues from JSON and convert to numpy array of uint64
+            mh.hashvalues = np.array(json.loads(row['bk_minhash']), dtype='uint64')
+            lsh.insert(row['record_id'], mh)
+            minhashes[row['record_id']] = mh
         
     # Query LSH
-    lsh_pairs = set()
-    for record_id, mh in minhashes.items():
+    if not minhashes:
+        print("  > No MinHash objects available; skipping LSH candidate generation.")
+    else:
+        print("  > Querying LSH Index...")
+    for record_id, mh in (minhashes or {}).items():
         result = lsh.query(mh)
         for other_id in result:
             # Enforce ordering to avoid duplicates and self-matches
@@ -154,103 +183,227 @@ def get_candidates(conn):
     
     return pairs_df
 
-def calculate_features(pairs, df_dict):
+def calculate_features(pairs, df_lookup):
     """
     Calculates similarity features for each pair.
-    df_dict: Dictionary mapping record_id -> row (dict) for fast lookup.
+    df_lookup: 
+        - DataFrame (Batch Mode): Contains all records indexed by record_id or as columns.
+        - Dictionary (API Mode): mapping record_id -> row (dict).
     """
     print("Calculating comparison features...")
     
-    features = []
-    
-    for _, row in pairs.iterrows():
-        id_a = row['id_a']
-        id_b = row['id_b']
-        
-        rec_a = df_dict[id_a]
-        rec_b = df_dict[id_b]
-        
-        feat = {
-            'id_a': id_a,
-            'id_b': id_b,
-        }
-        
-        # --- 1. EXACT MATCH FLAGS ---
-        # National ID (Strongest)
-        # We use Damerau-Levenshtein to catch transpositions (81 -> 18) which count as dist=1
-        nid_a = rec_a['norm_nid'] or ""
-        nid_b = rec_b['norm_nid'] or ""
-        if nid_a and nid_b:
-            # Damerau-Levenshtein handles swaps (12 -> 21) as 1 edit
-            dist = jellyfish.damerau_levenshtein_distance(nid_a, nid_b)
-            max_len = max(len(nid_a), len(nid_b))
+    # --- BATCH MODE (DataFrame) ---
+    if isinstance(df_lookup, pd.DataFrame):
+        # 1. Merge Data
+        # Ensure record_id is available for merging
+        if 'record_id' not in df_lookup.columns:
+            df_lookup = df_lookup.reset_index()
             
-            if dist == 0:
-                feat['nid_score'] = 1.0
-            elif max_len > 0:
-                # Normalize to 0-1 score
-                # e.g. Dist=1, Len=9 -> 1 - (1/9) = 0.88
-                # e.g. Dist=2, Len=9 -> 1 - (2/9) = 0.77
-                feat['nid_score'] = 1.0 - (dist / max_len)
+        # Merge A
+        merged = pairs.merge(
+            df_lookup, 
+            left_on='id_a', 
+            right_on='record_id', 
+            suffixes=('', '_a')
+        )
+        # Rename columns from first merge to ensure _a suffix if they collide
+        # The default merge behavior only suffixes overlapping columns. 
+        # We need to be explicit or handle the resulting column names correctly.
+        
+        # Merge B
+        merged = merged.merge(
+            df_lookup, 
+            left_on='id_b', 
+            right_on='record_id', 
+            suffixes=('_a', '_b')
+        )
+        
+        # DEBUG: Print columns to diagnose 0.0 feature issue
+        # print(f"Merged Columns: {merged.columns.tolist()}")
+        
+        # 2. Define Helper for Parallel Execution
+        def compute_chunk(chunk):
+            chunk_feats = []
+            for _, row in chunk.iterrows():
+                feat = {'id_a': row['id_a'], 'id_b': row['id_b']}
+                
+                # Extract values (handle NaNs)
+                # CRITICAL FIX: Check for both suffixed and unsuffixed versions
+                # When merging, if a column is unique to one side, it might not get a suffix.
+                # But here we are merging the SAME table twice, so suffixes should appear.
+                # However, 'norm_nid' might become 'norm_nid_a' and 'norm_nid_b'.
+                
+                nid_a = str(row.get('norm_nid_a', row.get('norm_nid', '')) or '')
+                nid_b = str(row.get('norm_nid_b', '') or '')
+                
+                email_a = str(row.get('norm_email_a', row.get('norm_email', '')) or '')
+                email_b = str(row.get('norm_email_b', '') or '')
+                
+                phone_a = str(row.get('norm_phone_a', row.get('norm_phone', '')) or '')
+                phone_b = str(row.get('norm_phone_b', '') or '')
+                
+                fn_a = str(row.get('norm_first_name_a', row.get('norm_first_name', '')) or '')
+                fn_b = str(row.get('norm_first_name_b', '') or '')
+                
+                ln_a = str(row.get('norm_last_name_a', row.get('norm_last_name', '')) or '')
+                ln_b = str(row.get('norm_last_name_b', '') or '')
+                
+                addr_a = str(row.get('norm_address_a', row.get('norm_address', '')) or '')
+                addr_b = str(row.get('norm_address_b', '') or '')
+                
+                dob_a = str(row.get('norm_dob_a', row.get('norm_dob', '')) or '')
+                dob_b = str(row.get('norm_dob_b', '') or '')
+                
+                year_a = str(row.get('norm_dob_year_a', row.get('norm_dob_year', '')) or '')
+                year_b = str(row.get('norm_dob_year_b', '') or '')
+
+                # --- METRICS ---
+                
+                # NID (Damerau-Levenshtein)
+                if nid_a and nid_b:
+                    dist = jellyfish.damerau_levenshtein_distance(nid_a, nid_b)
+                    max_len = max(len(nid_a), len(nid_b))
+                    feat['nid_score'] = 1.0 if dist == 0 else (1.0 - (dist / max_len) if max_len > 0 else 0.0)
+                    feat['nid_both_present'] = 1
+                else:
+                    feat['nid_score'] = 0.0
+                    feat['nid_both_present'] = 0
+                    
+                # Email (Jaro-Winkler)
+                feat['email_score'] = jellyfish.jaro_winkler_similarity(email_a, email_b)
+                
+                # Phone (Exact)
+                feat['phone_match'] = 1 if phone_a and phone_b and phone_a == phone_b else 0
+                
+                # Names (Jaro-Winkler)
+                feat['first_name_score'] = jellyfish.jaro_winkler_similarity(fn_a, fn_b)
+                feat['last_name_score'] = jellyfish.jaro_winkler_similarity(ln_a, ln_b)
+                
+                # Address (Levenshtein)
+                if addr_a and addr_b:
+                    max_len = max(len(addr_a), len(addr_b))
+                    dist = jellyfish.levenshtein_distance(addr_a, addr_b)
+                    feat['addr_score'] = 1.0 - (dist / max_len) if max_len > 0 else 0.0
+                else:
+                    feat['addr_score'] = 0.0
+                    
+                # DOB
+                feat['dob_match'] = 1 if dob_a and dob_b and dob_a == dob_b else 0
+                feat['dob_both_present'] = 1 if dob_a and dob_b else 0
+                feat['year_match'] = 1 if year_a and year_b and year_a == year_b and year_a != '0000' else 0
+                
+                chunk_feats.append(feat)
+            return pd.DataFrame(chunk_feats)
+
+        # 3. Execute in Parallel
+        # Split into chunks
+        n_jobs = -1 # Use all CPUs
+        chunks = np.array_split(merged, max(1, os.cpu_count() or 4))
+        
+        print(f"  > Processing {len(merged)} pairs in parallel...")
+        results = joblib.Parallel(n_jobs=n_jobs)(
+            joblib.delayed(compute_chunk)(chunk) for chunk in chunks
+        )
+        
+        return pd.concat(results, ignore_index=True)
+
+    # --- API MODE (Dictionary) ---
+    else:
+        df_dict = df_lookup
+        features = []
+        
+        for _, row in pairs.iterrows():
+            id_a = row['id_a']
+            id_b = row['id_b']
+            
+            rec_a = df_dict[id_a]
+            rec_b = df_dict[id_b]
+            
+            feat = {
+                'id_a': id_a,
+                'id_b': id_b,
+            }
+            
+            # --- 1. EXACT MATCH FLAGS ---
+            # National ID (Strongest)
+            # We use Damerau-Levenshtein to catch transpositions (81 -> 18) which count as dist=1
+            nid_a = rec_a['norm_nid'] or ""
+            nid_b = rec_b['norm_nid'] or ""
+            if nid_a and nid_b:
+                # Damerau-Levenshtein handles swaps (12 -> 21) as 1 edit
+                dist = jellyfish.damerau_levenshtein_distance(nid_a, nid_b)
+                max_len = max(len(nid_a), len(nid_b))
+                
+                if dist == 0:
+                    feat['nid_score'] = 1.0
+                elif max_len > 0:
+                    # Normalize to 0-1 score
+                    # e.g. Dist=1, Len=9 -> 1 - (1/9) = 0.88
+                    # e.g. Dist=2, Len=9 -> 1 - (2/9) = 0.77
+                    feat['nid_score'] = 1.0 - (dist / max_len)
+                else:
+                    feat['nid_score'] = 0.0
+                feat['nid_both_present'] = 1
             else:
                 feat['nid_score'] = 0.0
-        else:
-            feat['nid_score'] = 0.0
+                feat['nid_both_present'] = 0
+                
+            # Email (Strong)
+            # We use Jaro-Winkler for Email to catch typos
+            feat['email_score'] = jellyfish.jaro_winkler_similarity(
+                rec_a['norm_email'] or "", 
+                rec_b['norm_email'] or ""
+            )
+                
+            # Phone (Strong)
+            # Exact match only for now (normalization handles most issues)
+            if rec_a['norm_phone'] and rec_b['norm_phone']:
+                feat['phone_match'] = 1 if rec_a['norm_phone'] == rec_b['norm_phone'] else 0
+            else:
+                feat['phone_match'] = 0
+                
+            # --- 2. FUZZY STRING METRICS ---
+            # Names (Jaro-Winkler is good for typos/short names)
+            feat['first_name_score'] = jellyfish.jaro_winkler_similarity(
+                rec_a['norm_first_name'] or "", 
+                rec_b['norm_first_name'] or ""
+            )
+            feat['last_name_score'] = jellyfish.jaro_winkler_similarity(
+                rec_a['norm_last_name'] or "", 
+                rec_b['norm_last_name'] or ""
+            )
             
-        # Email (Strong)
-        # We use Jaro-Winkler for Email to catch typos
-        feat['email_score'] = jellyfish.jaro_winkler_similarity(
-            rec_a['norm_email'] or "", 
-            rec_b['norm_email'] or ""
-        )
+            # Address (Levenshtein is better for longer strings, normalized to 0-1)
+            addr_a = rec_a['norm_address'] or ""
+            addr_b = rec_b['norm_address'] or ""
+            if addr_a and addr_b:
+                max_len = max(len(addr_a), len(addr_b))
+                dist = jellyfish.levenshtein_distance(addr_a, addr_b)
+                feat['addr_score'] = 1 - (dist / max_len)
+            else:
+                feat['addr_score'] = 0
+                
+            # City
+            feat['city_score'] = jellyfish.jaro_winkler_similarity(
+                rec_a['norm_city'] or "", 
+                rec_b['norm_city'] or ""
+            )
             
-        # Phone (Strong)
-        # Exact match only for now (normalization handles most issues)
-        if rec_a['norm_phone'] and rec_b['norm_phone']:
-            feat['phone_match'] = 1 if rec_a['norm_phone'] == rec_b['norm_phone'] else 0
-        else:
-            feat['phone_match'] = 0
+            # --- 3. DATE METRICS ---
+            # Exact DOB Match (using normalized YYYY-MM-DD)
+            if rec_a['norm_dob'] and rec_b['norm_dob']:
+                feat['dob_match'] = 1 if rec_a['norm_dob'] == rec_b['norm_dob'] else 0
+                feat['dob_both_present'] = 1
+            else:
+                feat['dob_match'] = 0
+                feat['dob_both_present'] = 0
             
-        # --- 2. FUZZY STRING METRICS ---
-        # Names (Jaro-Winkler is good for typos/short names)
-        feat['first_name_score'] = jellyfish.jaro_winkler_similarity(
-            rec_a['norm_first_name'] or "", 
-            rec_b['norm_first_name'] or ""
-        )
-        feat['last_name_score'] = jellyfish.jaro_winkler_similarity(
-            rec_a['norm_last_name'] or "", 
-            rec_b['norm_last_name'] or ""
-        )
-        
-        # Address (Levenshtein is better for longer strings, normalized to 0-1)
-        addr_a = rec_a['norm_address'] or ""
-        addr_b = rec_b['norm_address'] or ""
-        if addr_a and addr_b:
-            max_len = max(len(addr_a), len(addr_b))
-            dist = jellyfish.levenshtein_distance(addr_a, addr_b)
-            feat['addr_score'] = 1 - (dist / max_len)
-        else:
-            feat['addr_score'] = 0
+            # Year Match (Soft check)
+            feat['year_match'] = 1 if rec_a['norm_dob_year'] == rec_b['norm_dob_year'] and rec_a['norm_dob_year'] != '0000' else 0
             
-        # City
-        feat['city_score'] = jellyfish.jaro_winkler_similarity(
-            rec_a['norm_city'] or "", 
-            rec_b['norm_city'] or ""
-        )
-        
-        # --- 3. DATE METRICS ---
-        # Exact DOB Match (using normalized YYYY-MM-DD)
-        if rec_a['norm_dob'] and rec_b['norm_dob']:
-            feat['dob_match'] = 1 if rec_a['norm_dob'] == rec_b['norm_dob'] else 0
-        else:
-            feat['dob_match'] = 0
-        
-        # Year Match (Soft check)
-        feat['year_match'] = 1 if rec_a['norm_dob_year'] == rec_b['norm_dob_year'] and rec_a['norm_dob_year'] != '0000' else 0
-        
-        features.append(feat)
-        
-    return pd.DataFrame(features)
+            features.append(feat)
+            
+        return pd.DataFrame(features)
 
 def decide_match_status(row):
     """
@@ -275,18 +428,19 @@ def decide_match_status(row):
         reasons.append("Rule 1: Strong National ID & Name Match")
         score = max(score, 0.95)
         
-    # Rule 2: Strong Contact Info + Name
-    # Email/Phone are unique. If they match exactly and name is decent (>0.80), it's a match.
-    # Threshold 0.80 catches "P. Ortmann" vs "Prmin Ortmann" (Case 0).
+    # Rule 2: Strong Contact Info + Name + (DOB or ID)
+    # Email/Phone are unique, but data generation might reuse emails for same names.
+    # So we require at least some corroboration from DOB or ID.
     if (row['email_score'] > 0.95 or row['phone_match'] == 1) and name_avg > 0.80:
-        is_match = True
-        reasons.append("Rule 2: Strong Contact Info & Name Match")
-        score = max(score, 0.90)
+        # Check for corroboration
+        if row['dob_match'] == 1 or row['nid_score'] > 0.5 or row['year_match'] == 1:
+            is_match = True
+            reasons.append("Rule 2: Strong Contact Info & Name Match (Verified)")
+            score = max(score, 0.90)
         
     # Rule 3: Exact DOB + Strong Name
-    # DOB + Last Name is very strong.
-    # Threshold 0.75 catches "M. Suarez" vs "Milagros Suarez" (Case 3, 6, 14) where name_avg is ~0.77.
-    if name_avg > 0.75 and row['dob_match'] == 1:
+    # DOB + Last Name is very strong. Increased threshold to 0.85 to avoid false positives with common names.
+    if name_avg > 0.85 and row['dob_match'] == 1:
         is_match = True
         reasons.append("Rule 3: Exact DOB & Strong Name Match")
         score = max(score, 0.85)
@@ -521,14 +675,15 @@ def run_matching():
     print("Loading processed data for lookup...")
     df_all = pd.read_sql("SELECT * FROM clients_processed", conn)
     # Convert to dict for O(1) lookup: {record_id: {col: val, ...}}
-    df_dict = df_all.set_index('record_id').to_dict('index')
+    # df_dict = df_all.set_index('record_id').to_dict('index')
     all_record_ids = df_all['record_id'].tolist()
     
     # 2. Generate Candidates
     pairs_df = get_candidates(conn)
     
     # 3. Feature Engineering
-    features_df = calculate_features(pairs_df, df_dict)
+    # OPTIMIZATION: Pass DataFrame for parallel processing
+    features_df = calculate_features(pairs_df, df_all)
     
     # 4. Classification
     classified_df = classify_pairs(features_df)

@@ -22,7 +22,8 @@ def load_data_and_generate_training_set():
     # 1. Load Processed Data (for features)
     print("Loading processed data...")
     df_all = pd.read_sql("SELECT * FROM clients_processed", conn)
-    df_dict = df_all.set_index('record_id').to_dict('index')
+    # OPTIMIZATION: Pass DataFrame directly to calculate_features for parallel processing
+    # df_dict = df_all.set_index('record_id').to_dict('index')
     
     # 2. Load Ground Truth (for labels)
     print("Loading ground truth...")
@@ -35,7 +36,7 @@ def load_data_and_generate_training_set():
     
     # 4. Calculate Features
     print("Calculating features for training...")
-    features_df = calculate_features(pairs_df, df_dict)
+    features_df = calculate_features(pairs_df, df_all)
     
     # 5. Create Labels
     print("Generating labels...")

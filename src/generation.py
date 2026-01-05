@@ -145,28 +145,46 @@ def get_alternate_national_id(country_code, current_fake):
         return current_fake.rvnr()
     return current_fake.bothify('??######')
 
-def generate_ground_truth(n_entities=100):
+
+def generate_ground_truth(n_entities=1000, collision_rate=0.05):
     ground_truth = []
     
     for _ in range(n_entities):
-        # 1. Pick Country
-        country_code = random.choice(['PL', 'US', 'ES', 'DE'])
-        current_fake = fakers[country_code]
-        
-        gender = random.choice(['M', 'F'])
-        
-        # 2. Generate Name (Strictly from that country's generator)
-        if country_code == 'ES':
-            # Spanish: often two surnames
-            fname = current_fake.first_name()
-            lname = f"{current_fake.last_name()} {current_fake.last_name()}"
+        # DECISION: Create a "Doppelganger" (Hard Negative)?
+        # We copy Name + DOB from an existing person, but generate new ID/Contact.
+        # This forces the model to learn that Name+DOB is not enough.
+        is_collision = False
+        if len(ground_truth) > 100 and random.random() < collision_rate:
+            is_collision = True
+            base_entity = random.choice(ground_truth)
+            country_code = base_entity['country']
+            current_fake = fakers[country_code]
+            
+            fname = base_entity['first_name']
+            lname = base_entity['last_name']
+            dob = base_entity['dob']
+            gender = 'M' # Simplified, doesn't matter for collision
         else:
-            if gender == 'M':
-                fname = current_fake.first_name_male()
-                lname = current_fake.last_name_male()
+            # 1. Pick Country
+            country_code = random.choice(['PL', 'US', 'ES', 'DE'])
+            current_fake = fakers[country_code]
+            
+            gender = random.choice(['M', 'F'])
+            
+            # 2. Generate Name (Strictly from that country's generator)
+            if country_code == 'ES':
+                # Spanish: often two surnames
+                fname = current_fake.first_name()
+                lname = f"{current_fake.last_name()} {current_fake.last_name()}"
             else:
-                fname = current_fake.first_name_female()
-                lname = current_fake.last_name_female()
+                if gender == 'M':
+                    fname = current_fake.first_name_male()
+                    lname = current_fake.last_name_male()
+                else:
+                    fname = current_fake.first_name_female()
+                    lname = current_fake.last_name_female()
+            
+            dob = current_fake.date_of_birth(minimum_age=18, maximum_age=80)
 
         # 3. Generate Email
         # Use Faker's locale-specific email provider for realism (e.g., .pl, .de domains)
@@ -289,8 +307,11 @@ def generate_messy_dataset(ground_truth, noise_multiplier=3):
 if __name__ == "__main__":
     ensure_output_dir()
     
-    print("Generating Ground Truth Entities...")
-    ground_truth = generate_ground_truth(n_entities=1000)
+    # Target: ~100k records
+    # Multiplier 3 -> Avg 2.5 records per entity (1 base + avg 1.5 dupes)
+    # 40,000 * 2.5 = 100,000
+    print("Generating Ground Truth Entities (with 5% Doppelgangers)...")
+    ground_truth = generate_ground_truth(n_entities=1000, collision_rate=0.05)
     
     print("Generating Messy Observations...")
     df_messy = generate_messy_dataset(ground_truth, noise_multiplier=3)

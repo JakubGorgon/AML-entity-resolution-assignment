@@ -15,6 +15,20 @@ __pycache__/
 venv/
 env/
 
+# Generated artifacts
+data/
+
+# Model artifacts
+models/*.pkl
+models/*.joblib
+models/*.bin
+models/*.onnx
+
+# Local databases (if created outside data/)
+*.db
+*.sqlite
+*.sqlite3
+
 # OS / editor
 .DS_Store
 Thumbs.db
