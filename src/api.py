@@ -257,7 +257,7 @@ async def resolve_entity(client: ClientRequest):
         # 3. Calculate Features
         # Prepare pairs DataFrame
         pairs_data = []
-        df_dict = {0: record} # 0 is our input ID
+        df_dict = {0: record} # 0 is the input ID
         
         for idx, cand in candidates.iterrows():
             cand_id = cand['record_id']

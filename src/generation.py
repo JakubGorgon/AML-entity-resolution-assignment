@@ -6,7 +6,7 @@ import string
 from datetime import datetime
 import sqlite3
 import os
-from unidecode import unidecode  # Make sure to pip install unidecode
+from unidecode import unidecode 
 
 # Config
 RANDOM_SEED = 42

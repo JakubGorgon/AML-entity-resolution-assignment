@@ -458,6 +458,16 @@ def decide_match_status(row):
     if row['ml_prob'] > 0.8: 
         is_match = True
         reasons.append(f"Rule 5: High ML Probability ({row['ml_prob']:.2f})")
+        
+        # Add granular explanations for ML decisions
+        if row['email_score'] > 0.95:
+            reasons.append("Reason: Exact Email Match")
+        if row['phone_match'] == 1:
+            reasons.append("Reason: Exact Phone Match")
+        if row['nid_score'] > 0.95:
+             reasons.append("Reason: Strong National ID Match")
+        if row['dob_match'] == 1:
+             reasons.append("Reason: Exact Date of Birth Match")
         score = max(score, row['ml_prob'])
 
     # Rule 6: Strong ID + Initials/Year Match 

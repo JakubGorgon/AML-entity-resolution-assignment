@@ -1,7 +1,7 @@
 # Entity Resolution Service Architecture
 
 ## 1. Overview
-This component is designed as a stateless microservice responsible for resolving client identities against a watchlist (Sanctions/PEP). It operates in an on-premise, air-gapped environment.
+This component is designed as a stateless microservice responsible for resolving client identities against a watchlist (Sanctions/PEP).
 
 ## 2. API Contract (OpenAPI)
 
@@ -22,14 +22,50 @@ This component is designed as a stateless microservice responsible for resolving
 ```json
 {
   "status": "match",
+  "matches": [
+    {
+      "candidate_id": "fab58e7f-1685-4873-a346-4ead834b11c2",
+      "match_type": "match",
+      "confidence_score": 0.9992,
+      "ml_probability": 0.9992,
+      "scores": {
+        "name": 1,
+        "national_id": 1,
+        "email": 1,
+        "phone": 1,
+        "address": 1
+      },
+      "explanation": [
+        "Rule 1: Strong National ID & Name Match",
+        "Rule 2: Strong Contact Info & Name Match (Verified)",
+        "Rule 5: High ML Probability (1.00)",
+        "Reason: Exact Email Match",
+        "Reason: Exact Phone Match",
+        "Reason: Strong National ID Match"
+      ]
+    }
+  ],
   "best_match": {
-    "candidate_id": 1042,
+    "candidate_id": "fab58e7f-1685-4873-a346-4ead834b11c2",
     "match_type": "match",
-    "confidence_score": 0.98,
-    "explanation": ["Strong National ID Match", "High ML Confidence"]
+    "confidence_score": 0.9992,
+    "ml_probability": 0.9992,
+    "scores": {
+      "name": 1,
+      "national_id": 1,
+      "email": 1,
+      "phone": 1,
+      "address": 1
+    },
+    "explanation": [
+      "Rule 1: Strong National ID & Name Match",
+      "Rule 2: Strong Contact Info & Name Match (Verified)",
+      "Rule 5: High ML Probability (1.00)",
+      "Reason: Exact Email Match"
+    ]
   },
-  "candidates_checked": 12,
-  "processing_time_ms": 45.2
+  "candidates_checked": 7,
+  "processing_time_ms": 54.01
 }
 ```
 
@@ -41,9 +77,13 @@ This component is designed as a stateless microservice responsible for resolving
 
 ### Database Bottlenecks
 - **Blocking Strategy:** We use a "Blocking" technique (Indexing) to reduce the search space from $O(N)$ to $O(1)$ (approx).
+- **Current PoC Optimizations:**
+    - **LSH (Locality Sensitive Hashing):** Reduces fuzzy search space drastically.
+    - **Optimized SQL:** Uses `UNION` instead of `OR` to enforce index usage.
+    - **Parallelism:** Parallel feature calculation in batch mode; Async thread-pool execution for DB queries in API mode.
 - **Future Optimization:** For high load (>1000 RPS), the SQLite database should be replaced with:
     - **PostgreSQL** with Read Replicas.
-    - **Elasticsearch** for fuzzy blocking queries.
+    - **Elasticsearch** or **Milvus** for scalable vector search.
     - **Redis** for caching frequent queries.
 
 ## 4. Quality Monitoring & Observability
@@ -55,15 +95,17 @@ The service exposes a `/metrics` endpoint scraping:
 - `er_request_latency_seconds`: P95/P99 latency tracking.
 
 ### Logging
-- **Structured Logging:** JSON-formatted logs for easy ingestion (ELK Stack).
-- **PII Protection:** No sensitive data (Names, IDs) is ever written to logs. Only Request IDs and non-sensitive metadata.
+- **Standard Logging:** Timestamped text logs tracking service lifecycle and errors.
+- **PII Protection:** Request payloads containing sensitive data (Names, IDs) are not logged.
 
 ## 5. Model Versioning & Rollback
-- **Artifact Management:** Models are versioned (e.g., `model_v1.pkl`, `model_v2.pkl`).
-- **Configuration:** The active model path is configurable via Environment Variables (`MODEL_PATH`).
-- **Rollback:** Reverting to a previous model version is as simple as changing the env var and restarting the container (or using a Canary Deployment strategy).
+- **Design Requirement:** In a production 50M-client environment, strict model governance is required.
+    - **Artifact Management:** Models should be versioned (e.g., `model_v1.pkl`, `model_v2.pkl`) in an artifact registry (Artifactory/S3).
+    - **Configuration:** The active model path is configurable via Environment Variables (`MODEL_PATH`).
+    - **Rollback:** Reverting to a previous model involves rolling back the deployment to the previous Docker image/config.
+- **Current PoC:** The system loads a single model file at startup. 
 
 ## 6. Security & Audit
 - **Audit Trail:** Every decision includes an `explanation` field detailing *why* a match was found (e.g., "Exact Email Match").
 - **Encryption:** All traffic should be encrypted via TLS (handled by the Ingress Controller/Load Balancer).
-- **Data Minimization:** The API only returns the ID and Score, not the full sensitive profile of the matched candidate, unless authorized.
+
