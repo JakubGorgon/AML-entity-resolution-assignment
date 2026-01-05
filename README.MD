@@ -6,7 +6,7 @@ This repository contains a Proof of Concept (PoC) for an Entity Resolution syste
 
 The easiest way to run this project is via the provided Jupyter Notebook in Google Colab.
 
-1.  **Open `notebooks/prototype.ipynb`**.
+1.  **Open and download `notebooks/prototype.ipynb`**.
 2.  Upload the notebook to Google Colab.
 3.  Run the cells sequentially. The notebook handles:
     *   Downloading the repository.
@@ -22,7 +22,7 @@ The easiest way to run this project is via the provided Jupyter Notebook in Goog
 1.  **Clone the repository**:
     ```bash
     git clone <repo-url>
-    cd silent-eight-assignment
+    cd AML-entity-resolution-assignment
     ```
 2.  **Install dependencies**:
     ```bash
