@@ -1,10 +1,14 @@
 import sqlite3
 import pandas as pd
+import numpy as np
 import jellyfish
 import networkx as nx
 from datetime import datetime
 import joblib
 import os
+import json
+from datasketch import MinHash, MinHashLSH
+from pathlib import Path
 
 # Configuration
 DB_PATH = "data/clients.db"
@@ -39,7 +43,7 @@ def analyze_blocking_stats(conn, pairs_count):
     # 3. Block Size Analysis (The "Heavy Hitters")
     # Large blocks (e.g., "Smith") cause quadratic explosions (O(N^2)).
     # We monitor the Top 3 largest blocks to identify "Stop Words" or generic values.
-    keys = ['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_phone', 'bk_email']
+    keys = ['bk_nid', 'bk_phone', 'bk_email']
     
     print("\n[Block Size Analysis - Top 3 Largest Blocks per Key]")
     for key in keys:
@@ -66,34 +70,89 @@ def analyze_blocking_stats(conn, pairs_count):
 
 def get_candidates(conn):
     """
-    Generates candidate pairs using SQL Blocking.
+    Generates candidate pairs using LSH (for names) and SQL Blocking (for exact keys).
     Returns a DataFrame with columns: [id_a, id_b]
     """
-    print("Generating candidates via Blocking Keys...")
+    print("Generating candidates via LSH & Blocking Keys...")
     
-    # We perform a Self-Join on the blocking keys.
-    # We use 'record_id < record_id' to ensure:
-    # 1. No self-matches (A=A)
-    # 2. No duplicate pairs (A=B and B=A)
+    # 1. LSH for Fuzzy Name Matching
+    print("  > Building LSH Index for Names...")
+    # Only fetch records that have a minhash signature
+    df_lsh = pd.read_sql("SELECT record_id, bk_minhash FROM clients_processed WHERE bk_minhash IS NOT NULL", conn)
+    
+    # Threshold 0.4 means ~40% Jaccard similarity
+    # Lowered from 0.5 to catch more typos and initial variations
+    lsh = MinHashLSH(threshold=0.4, num_perm=128)
+    minhashes = {}
+    
+    for _, row in df_lsh.iterrows():
+        mh = MinHash(num_perm=128)
+        # Load hashvalues from JSON and convert to numpy array of uint64
+        mh.hashvalues = np.array(json.loads(row['bk_minhash']), dtype='uint64')
+        lsh.insert(row['record_id'], mh)
+        minhashes[row['record_id']] = mh
+        
+    # Query LSH
+    lsh_pairs = set()
+    for record_id, mh in minhashes.items():
+        result = lsh.query(mh)
+        for other_id in result:
+            # Enforce ordering to avoid duplicates and self-matches
+            if record_id < other_id:
+                lsh_pairs.add((record_id, other_id))
+                
+    print(f"  > Found {len(lsh_pairs)} pairs via LSH.")
+
+    # 2. Exact Blocking (SQL)
+    # OPTIMIZATION: We use UNION instead of OR to force the use of Indexes.
+    # An OR condition in a JOIN often leads to a full table scan.
+    # UNION allows the DB to use the specific index for each key (idx_bk_nid, idx_bk_email, etc.)
+    print("  > Querying Exact Blocking Keys (Optimized with UNION)...")
+    
     query = """
-    SELECT DISTINCT t1.record_id as id_a, t2.record_id as id_b
+    SELECT t1.record_id as id_a, t2.record_id as id_b
     FROM clients_processed t1
-    JOIN clients_processed t2 ON
-        (t1.bk_nid = t2.bk_nid AND t1.bk_nid IS NOT NULL) OR
-        (t1.bk_phonetic_year = t2.bk_phonetic_year AND t1.bk_phonetic_year IS NOT NULL) OR
-        (t1.bk_initials = t2.bk_initials AND t1.bk_initials IS NOT NULL) OR
-        (t1.bk_phone = t2.bk_phone AND t1.bk_phone IS NOT NULL) OR
-        (t1.bk_email = t2.bk_email AND t1.bk_email IS NOT NULL)
-    WHERE t1.record_id < t2.record_id
+    JOIN clients_processed t2 ON t1.bk_nid = t2.bk_nid
+    WHERE t1.bk_nid IS NOT NULL AND t1.record_id < t2.record_id
+    
+    UNION
+    
+    SELECT t1.record_id as id_a, t2.record_id as id_b
+    FROM clients_processed t1
+    JOIN clients_processed t2 ON t1.bk_phone = t2.bk_phone
+    WHERE t1.bk_phone IS NOT NULL AND t1.record_id < t2.record_id
+    
+    UNION
+    
+    SELECT t1.record_id as id_a, t2.record_id as id_b
+    FROM clients_processed t1
+    JOIN clients_processed t2 ON t1.bk_email = t2.bk_email
+    WHERE t1.bk_email IS NOT NULL AND t1.record_id < t2.record_id
+    
+    UNION
+    
+    SELECT t1.record_id as id_a, t2.record_id as id_b
+    FROM clients_processed t1
+    JOIN clients_processed t2 ON t1.bk_initial_dob = t2.bk_initial_dob
+    WHERE t1.bk_initial_dob IS NOT NULL AND t1.record_id < t2.record_id
     """
     
-    pairs = pd.read_sql(query, conn)
-    print(f"Found {len(pairs)} candidate pairs.")
+    sql_pairs_df = pd.read_sql(query, conn)
+    print(f"  > Found {len(sql_pairs_df)} pairs via Exact Keys.")
+    
+    # 3. Merge
+    # Convert SQL pairs to set of tuples
+    sql_pairs = set(zip(sql_pairs_df['id_a'], sql_pairs_df['id_b']))
+    all_pairs = lsh_pairs.union(sql_pairs)
+    
+    pairs_df = pd.DataFrame(list(all_pairs), columns=['id_a', 'id_b'])
+    
+    print(f"Total Unique Candidate Pairs: {len(pairs_df)}")
     
     # Run Health Check
-    analyze_blocking_stats(conn, len(pairs))
+    analyze_blocking_stats(conn, len(pairs_df))
     
-    return pairs
+    return pairs_df
 
 def calculate_features(pairs, df_dict):
     """
@@ -206,38 +265,54 @@ def decide_match_status(row):
     # --- MATCH RULES ---
     is_match = False
     
-    # Rule 1: Strong ID + Strong Name
-    # We raised the name threshold from 0.5 to 0.8 to prevent "Weak Name" matches (e.g. "A." vs "Alex")
-    # from being auto-approved. Those should go to Review.
-    if row['nid_score'] >= 0.85 and name_avg > 0.80:
+    # --- MATCH RULES ---
+    # These rules are hierarchical. If any condition is met, it's a MATCH.
+    
+    # Rule 1: Strong National ID + Strong Name
+    # ID is unique. If ID matches (>0.9) and name is decent (>0.85), it's the same person.
+    if row['nid_score'] >= 0.90 and name_avg > 0.85:
         is_match = True
-        reasons.append("Strong National ID & Name Match")
+        reasons.append("Rule 1: Strong National ID & Name Match")
         score = max(score, 0.95)
         
-    if (row['email_score'] > 0.95 or row['phone_match'] == 1) and name_avg > 0.8:
+    # Rule 2: Strong Contact Info + Name
+    # Email/Phone are unique. If they match exactly and name is decent (>0.80), it's a match.
+    # Threshold 0.80 catches "P. Ortmann" vs "Prmin Ortmann" (Case 0).
+    if (row['email_score'] > 0.95 or row['phone_match'] == 1) and name_avg > 0.80:
         is_match = True
-        reasons.append("Strong Contact Info & Name Match")
+        reasons.append("Rule 2: Strong Contact Info & Name Match")
         score = max(score, 0.90)
         
-    if name_avg > 0.85 and row['dob_match'] == 1:
+    # Rule 3: Exact DOB + Strong Name
+    # DOB + Last Name is very strong.
+    # Threshold 0.75 catches "M. Suarez" vs "Milagros Suarez" (Case 3, 6, 14) where name_avg is ~0.77.
+    if name_avg > 0.75 and row['dob_match'] == 1:
         is_match = True
-        reasons.append("Exact DOB & Strong Name Match")
+        reasons.append("Rule 3: Exact DOB & Strong Name Match")
         score = max(score, 0.85)
         
-    if name_avg > 0.85 and row['addr_score'] > 0.7:
+    # Rule 4: Address + Strong Name
+    # Address is less unique (family members), so we require a stronger name match (>0.90).
+    if name_avg > 0.90 and row['addr_score'] > 0.8:
         is_match = True
-        reasons.append("Address & Strong Name Match")
+        reasons.append("Rule 4: Address & Strong Name Match")
         score = max(score, 0.85)
         
-    if name_avg > 0.93 and row['year_match'] == 1:
+    # Rule 5: High ML Probability
+    # The model knows best for complex non-linear patterns.
+    # Threshold 0.80 keeps False Positives low.
+    if row['ml_prob'] > 0.8: 
         is_match = True
-        reasons.append("Very Strong Name & Year Match")
-        score = max(score, 0.80)
-        
-    if row['ml_prob'] > 0.6: 
-        is_match = True
-        reasons.append(f"High ML Probability ({row['ml_prob']:.2f})")
+        reasons.append(f"Rule 5: High ML Probability ({row['ml_prob']:.2f})")
         score = max(score, row['ml_prob'])
+
+    # Rule 6: Strong ID + Initials/Year Match 
+    # Catch "M. Kilar" vs "Marek Kilar" (Case 15, 16).
+    # If ID is strong (>0.8) and Year matches, we accept a lower name score (>0.75) for initials.
+    if name_avg > 0.75 and row['year_match'] == 1 and row['nid_score'] > 0.8:
+        is_match = True
+        reasons.append("Rule 6: Strong ID + Initials Match")
+        score = max(score, 0.95)
         
     if is_match:
         status = 'match'
@@ -246,6 +321,11 @@ def decide_match_status(row):
     # --- REVIEW RULES ---
     is_review = False
     
+    if name_avg > 0.93 and row['year_match'] == 1:
+        is_review = True
+        reasons.append("Very Strong Name & Year Match (Common Name Risk)")
+        score = max(score, 0.75)
+
     if row['ml_prob'] > 0.2:
         is_review = True
         reasons.append(f"Moderate ML Probability ({row['ml_prob']:.2f})")
@@ -265,6 +345,19 @@ def decide_match_status(row):
         reasons.append("Exact Email Match Only")
         score = max(score, 0.55)
         
+    # --- MODEL VETO (Safe Rejection) ---
+    # If the ML model is confident this is NOT a match (< 10%), 
+    # we override the "Review" status to "No Match" to save manual effort.
+    # Exception: We do NOT veto if there is a strong ID or Email match (data errors).
+    if is_review and row['ml_prob'] < 0.10:
+        if row['nid_score'] < 0.9 and row['email_score'] < 0.9:
+            is_review = False
+            status = 'no_match'
+            reasons.append(f"Model Veto: Low ML Probability ({row['ml_prob']:.2f})")
+            # Reset score to low probability
+            score = row['ml_prob']
+            return pd.Series([status, score, "; ".join(reasons)], index=['match_type', 'confidence_score', 'explanation'])
+
     if is_review:
         status = 'review'
         return pd.Series([status, score, "; ".join(reasons)], index=['match_type', 'confidence_score', 'explanation'])

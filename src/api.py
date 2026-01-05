@@ -8,6 +8,10 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from prometheus_client import make_asgi_app, Counter, Histogram
 import time
+import json
+import numpy as np
+from datasketch import MinHash, MinHashLSH
+from pathlib import Path
 
 # Import our logic
 from src import preprocessing
@@ -72,13 +76,16 @@ app = FastAPI(
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
-# Global Model
+# Global Resources
 model = None
+lsh_index = None
 
 @app.on_event("startup")
 def load_resources():
-    global model
+    global model, lsh_index
     logger.info("Loading resources...")
+    
+    # Load ML Model
     if os.path.exists(MODEL_PATH):
         try:
             model = joblib.load(MODEL_PATH)
@@ -87,6 +94,32 @@ def load_resources():
             logger.error(f"Failed to load model: {e}")
     else:
         logger.warning("Model file not found. Running in Rule-Only mode.")
+        
+    # Build LSH Index
+    try:
+        logger.info("Building LSH Index for Name Matching...")
+        with sqlite3.connect(DB_PATH) as conn:
+            # Check if table exists first to avoid crash on fresh init
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clients_processed'")
+            if cursor.fetchone():
+                df_lsh = pd.read_sql("SELECT record_id, bk_minhash FROM clients_processed WHERE bk_minhash IS NOT NULL", conn)
+                
+                # Threshold 0.4 means ~40% Jaccard similarity
+                # Lowered from 0.5 to catch typos like "Alex" vs "Aleks"
+                lsh = MinHashLSH(threshold=0.4, num_perm=128)
+                count = 0
+                for _, row in df_lsh.iterrows():
+                    mh = MinHash(num_perm=128)
+                    mh.hashvalues = np.array(json.loads(row['bk_minhash']), dtype='uint64')
+                    lsh.insert(row['record_id'], mh)
+                    count += 1
+                lsh_index = lsh
+                logger.info(f"LSH Index built with {count} records.")
+            else:
+                logger.warning("clients_processed table not found. Skipping LSH build.")
+    except Exception as e:
+        logger.error(f"Failed to build LSH index: {e}")
 
 # --- HELPER FUNCTIONS ---
 
@@ -101,18 +134,29 @@ def get_db_connection():
 
 def find_candidates(conn, record: pd.Series, limit=50):
     """
-    Finds candidates in the DB using blocking keys from the input record.
+    Finds candidates in the DB using LSH (fuzzy name) and Exact Keys.
     """
-    # Extract keys from the single record
+    candidates_ids = set()
+    
+    # 1. LSH Lookup (Fuzzy Name)
+    # Use the global lsh_index built at startup
+    if lsh_index and record.get('bk_minhash'):
+        try:
+            mh = MinHash(num_perm=128)
+            mh.hashvalues = np.array(json.loads(record['bk_minhash']), dtype='uint64')
+            result = lsh_index.query(mh)
+            candidates_ids.update(result)
+        except Exception as e:
+            logger.error(f"LSH Query failed: {e}")
+            
+    # 2. Exact Keys Lookup
     keys = {
-        'bk_nid': record['bk_nid'],
-        'bk_phonetic_year': record['bk_phonetic_year'],
-        'bk_initials': record['bk_initials'],
-        'bk_phone': record['bk_phone'],
-        'bk_email': record['bk_email']
+        'bk_nid': record.get('bk_nid'),
+        'bk_phone': record.get('bk_phone'),
+        'bk_email': record.get('bk_email'),
+        'bk_initial_dob': record.get('bk_initial_dob')
     }
     
-    # Build dynamic query
     conditions = []
     params = []
     
@@ -121,14 +165,25 @@ def find_candidates(conn, record: pd.Series, limit=50):
             conditions.append(f"({key} = ?)")
             params.append(value)
             
-    if not conditions:
+    if conditions:
+        where_clause = " OR ".join(conditions)
+        # Fetch IDs first to merge with LSH results
+        query = f"SELECT record_id FROM clients_processed WHERE {where_clause} LIMIT ?"
+        exact_matches = pd.read_sql(query, conn, params=params + [limit])
+        candidates_ids.update(exact_matches['record_id'].tolist())
+        
+    if not candidates_ids:
         return pd.DataFrame()
         
-    where_clause = " OR ".join(conditions)
-    query = f"SELECT * FROM clients_processed WHERE {where_clause} LIMIT ?"
-    params.append(limit)
+    # Fetch full records for all candidate IDs
+    ids_list = list(candidates_ids)[:limit] # Apply limit to total
+    if not ids_list:
+        return pd.DataFrame()
+        
+    placeholders = ",".join(["?"] * len(ids_list))
+    query = f"SELECT * FROM clients_processed WHERE record_id IN ({placeholders})"
+    candidates = pd.read_sql(query, conn, params=ids_list)
     
-    candidates = pd.read_sql(query, conn, params=params)
     return candidates
 
 # --- ENDPOINTS ---
@@ -152,9 +207,15 @@ async def resolve_entity(client: ClientRequest):
         # 2. Find Candidates
         # We need a DB connection here. 
         # Since we are inside an async function, we should be careful with blocking calls.
-        # For SQLite, it's fast enough for this demo.
-        with sqlite3.connect(DB_PATH) as conn:
-            candidates = find_candidates(conn, record)
+        # We use run_in_executor to run the synchronous DB call in a separate thread.
+        import asyncio
+        loop = asyncio.get_event_loop()
+        
+        def query_db():
+            with sqlite3.connect(DB_PATH) as conn:
+                return find_candidates(conn, record)
+                
+        candidates = await loop.run_in_executor(None, query_db)
             
         if candidates.empty:
             duration = (time.time() - start_time) * 1000

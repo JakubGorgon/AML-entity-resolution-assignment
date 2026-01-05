@@ -4,9 +4,11 @@ from unidecode import unidecode
 import jellyfish
 import re
 import os
+import json
+from datasketch import MinHash
+from pathlib import Path
 
 # Configuration
-# Assuming script is run from project root
 DB_PATH = "data/clients.db"
 
 def normalize_text(text):
@@ -130,6 +132,27 @@ def get_soundex(text):
         return "0000"
     return jellyfish.soundex(normalize_text(text))
 
+def compute_minhash_signature(text, num_perm=128):
+    """
+    Computes MinHash signature for LSH.
+    Returns a list of integers (hash values) serialized as JSON string.
+    """
+    if not text:
+        return None
+    
+    m = MinHash(num_perm=num_perm)
+    # Create 3-char shingles (n-grams)
+    # e.g. "alex" -> "ale", "lex"
+    text = str(text).lower().strip()
+    if len(text) < 3:
+        m.update(text.encode('utf8'))
+    else:
+        for i in range(len(text) - 2):
+            m.update(text[i:i+3].encode('utf8'))
+            
+    # Return the hash values as a list
+    return json.dumps(m.hashvalues.tolist())
+
 def create_blocking_keys(df):
     """Adds blocking columns to the DataFrame."""
     
@@ -154,32 +177,22 @@ def create_blocking_keys(df):
     df['norm_dob_year'] = temp_dates.dt.year.fillna(0).astype(int).astype(str).replace('0', '0000')
 
     # --- 2. BLOCKING KEYS ---
-    # CRITICAL: We return None if any component is missing to avoid "Garbage Blocks"
-    # (e.g., a block of 10M people with missing DOB).
     
-    # KEY 1: Phonetic Surname + Year
-    # Require both Surname and Year to be present.
-    def make_bk_phonetic(row):
-        if not row['norm_last_name'] or row['norm_dob_year'] == '0000':
+    # KEY 1: MinHash Signature (Scalable Fuzzy Matching)
+    # Replaces Soundex and Initials which are O(N^2) risks.
+    def make_bk_minhash(row):
+        full_name = f"{row['norm_first_name'] or ''} {row['norm_last_name'] or ''}".strip()
+        if not full_name:
             return None
-        return get_soundex(row['norm_last_name']) + "_" + row['norm_dob_year']
+        return compute_minhash_signature(full_name)
         
-    df['bk_phonetic_year'] = df.apply(make_bk_phonetic, axis=1)
+    df['bk_minhash'] = df.apply(make_bk_minhash, axis=1)
 
     # KEY 2: National ID (Strong)
     # Only block if ID is valid (len > 4)
     df['bk_nid'] = df['norm_nid'].apply(lambda x: x if len(x) > 4 else None) 
 
-    # KEY 3: First Initial + Full Surname
-    # Require both First Name and Last Name.
-    def make_bk_initials(row):
-        if not row['norm_first_name'] or not row['norm_last_name']:
-            return None
-        return row['norm_first_name'][:1] + "_" + row['norm_last_name']
-
-    df['bk_initials'] = df.apply(make_bk_initials, axis=1)
-
-    # KEY 4: Phone (Last 6 digits)
+    # KEY 3: Phone (Last 6 digits)
     # Good for catching typos in names/DOBs
     def make_bk_phone(row):
         if row['norm_phone'] and len(row['norm_phone']) >= 6:
@@ -187,10 +200,21 @@ def create_blocking_keys(df):
         return None
     df['bk_phone'] = df.apply(make_bk_phone, axis=1)
 
-    # KEY 5: Email (Exact)
+    # KEY 4: Email (Exact)
     # Very strong key, catches almost all digital interactions
     # Ensure we don't block on empty strings or None
     df['bk_email'] = df['norm_email'].apply(lambda x: x if x else None)
+    
+    # KEY 5: Initials + Last Name + DOB (Safe Loose Blocking)
+    # Catches "M. Kilar" vs "Marek Kilar" without O(N^2) explosion.
+    # Format: "m|kilar|1960-06-24"
+    def make_bk_initial_dob(row):
+        if not row['norm_first_name'] or not row['norm_last_name'] or not row['norm_dob']:
+            return None
+        initial = row['norm_first_name'][0]
+        return f"{initial}|{row['norm_last_name']}|{row['norm_dob']}"
+        
+    df['bk_initial_dob'] = df.apply(make_bk_initial_dob, axis=1)
 
     return df
 
@@ -208,17 +232,29 @@ def run_preprocessing():
     print(df[['dob', 'norm_dob_year']].head(10))
     
     print("\n--- Blocking Keys Check ---")
-    print(df[['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_phone', 'bk_email']].head(5))
+    print(df[['bk_nid', 'bk_minhash', 'bk_phone', 'bk_email']].head(5))
     
     # Coverage Report
     # NOTE: Count how many keys are present per record. Useful for monitoring to see if data quality degrades -> more blocking keys may be needed.  
-    df['key_count'] = df[['bk_nid', 'bk_phonetic_year', 'bk_initials', 'bk_phone', 'bk_email']].notna().sum(axis=1)
+    df['key_count'] = df[['bk_nid', 'bk_minhash', 'bk_phone', 'bk_email']].notna().sum(axis=1)
     print("\n--- Blocking Key Coverage ---")
     print(df['key_count'].value_counts().sort_index())
     print(f"Orphans (0 keys): {len(df[df['key_count'] == 0])}")
 
     print("\nSaving processed data...")
     df.to_sql("clients_processed", conn, if_exists="replace", index=False)
+    
+    # --- CREATE INDEXES ---
+    # Critical for performance on large datasets (50M records).
+    # Without these, the blocking join is O(N^2) or O(N*M) full scan.
+    print("Creating indexes for blocking keys...")
+    cursor = conn.cursor()
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bk_nid ON clients_processed(bk_nid)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bk_phone ON clients_processed(bk_phone)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bk_email ON clients_processed(bk_email)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bk_initial_dob ON clients_processed(bk_initial_dob)")
+    conn.commit()
+    
     conn.close()
 
 if __name__ == "__main__":
