@@ -195,57 +195,83 @@ def calculate_features(pairs, df_dict):
 
 def decide_match_status(row):
     """
-    Determines the match status (match, review, no_match) for a single pair row.
-    Expects row to have feature columns and 'ml_prob'.
+    Determines the match status, confidence score, and explanation.
+    Returns a pd.Series with ['match_type', 'confidence_score', 'explanation']
     """
-    # Calculate Name Similarity Average
     name_avg = (row['first_name_score'] + row['last_name_score']) / 2
+    reasons = []
+    score = row['ml_prob'] # Base score from ML
+    status = 'no_match'
     
-    # --- RULE BASED LOGIC (High Precision) ---
+    # --- MATCH RULES ---
+    is_match = False
     
-    # RULE 1: Strong National ID Match
-    if row['nid_score'] >= 0.85 and name_avg > 0.5:
-        return 'match'
+    # Rule 1: Strong ID + Strong Name
+    # We raised the name threshold from 0.5 to 0.8 to prevent "Weak Name" matches (e.g. "A." vs "Alex")
+    # from being auto-approved. Those should go to Review.
+    if row['nid_score'] >= 0.85 and name_avg > 0.80:
+        is_match = True
+        reasons.append("Strong National ID & Name Match")
+        score = max(score, 0.95)
         
-    # RULE 2: Email/Phone Match (Corroborated)
     if (row['email_score'] > 0.95 or row['phone_match'] == 1) and name_avg > 0.8:
-        return 'match'
+        is_match = True
+        reasons.append("Strong Contact Info & Name Match")
+        score = max(score, 0.90)
         
-    # RULE 3: Strong Name + Date Match
     if name_avg > 0.85 and row['dob_match'] == 1:
-        return 'match'
+        is_match = True
+        reasons.append("Exact DOB & Strong Name Match")
+        score = max(score, 0.85)
         
-    # RULE 4: Strong Name + Address Match
     if name_avg > 0.85 and row['addr_score'] > 0.7:
-        return 'match'
+        is_match = True
+        reasons.append("Address & Strong Name Match")
+        score = max(score, 0.85)
         
-    # RULE 5: Very Strong Name Match (Rare Name assumption)
     if name_avg > 0.93 and row['year_match'] == 1:
-        return 'match'
+        is_match = True
+        reasons.append("Very Strong Name & Year Match")
+        score = max(score, 0.80)
         
-    # --- ML MODEL RESCUE (High Recall) ---
-    if row['ml_prob'] > 0.5:
-            return 'match'
-            
-    # --- MANUAL REVIEW (Gray Area) ---
-    # 1. ML Uncertainty: Model thinks there's a chance (20-50%)
+    if row['ml_prob'] > 0.6: 
+        is_match = True
+        reasons.append(f"High ML Probability ({row['ml_prob']:.2f})")
+        score = max(score, row['ml_prob'])
+        
+    if is_match:
+        status = 'match'
+        return pd.Series([status, score, "; ".join(reasons)], index=['match_type', 'confidence_score', 'explanation'])
+        
+    # --- REVIEW RULES ---
+    is_review = False
+    
     if row['ml_prob'] > 0.2:
-        return 'review'
+        is_review = True
+        reasons.append(f"Moderate ML Probability ({row['ml_prob']:.2f})")
         
-    # 2. Strong ID but weak name (Possible data entry error or fraud)
     if row['nid_score'] >= 0.85:
-        return 'review'
+        is_review = True
+        reasons.append("Strong ID but Weak Name Match")
+        score = max(score, 0.60)
         
-    # 3. Very Strong Name but no other corroboration (Possible missing data)
     if name_avg > 0.9:
-        return 'review'
+        is_review = True
+        reasons.append("Strong Name Match Only")
+        score = max(score, 0.50)
         
-    # 4. Exact Email Match (New Rule)
-    # Emails are unique. If they match, it's highly suspicious even if names differ.
     if row['email_score'] == 1.0:
-        return 'review'
-
-    return 'no_match'
+        is_review = True
+        reasons.append("Exact Email Match Only")
+        score = max(score, 0.55)
+        
+    if is_review:
+        status = 'review'
+        return pd.Series([status, score, "; ".join(reasons)], index=['match_type', 'confidence_score', 'explanation'])
+        
+    # --- NO MATCH ---
+    reasons.append("No strong matching signals found")
+    return pd.Series([status, score, "; ".join(reasons)], index=['match_type', 'confidence_score', 'explanation'])
 
 def classify_pairs(features_df):
     """
@@ -278,7 +304,7 @@ def classify_pairs(features_df):
     else:
         features_df['ml_prob'] = 0.0
     
-    features_df['match_type'] = features_df.apply(decide_match_status, axis=1)
+    features_df[['match_type', 'confidence_score', 'explanation']] = features_df.apply(decide_match_status, axis=1)
     features_df['is_match'] = (features_df['match_type'] == 'match').astype(int)
     
     counts = features_df['match_type'].value_counts()

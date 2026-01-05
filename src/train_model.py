@@ -9,7 +9,6 @@ import os
 from src.matching import get_candidates, calculate_features
 
 # Configuration
-# Assuming script is run from project root
 DB_PATH = "data/clients.db"
 MODEL_DIR = "models"
 MODEL_PATH = os.path.join(MODEL_DIR, "entity_resolution_model.pkl")
